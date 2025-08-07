@@ -182,16 +182,24 @@ func (r *basePoolManager) HandleWorkflowJob(job params.WorkflowJob) error {
 			if err != nil {
 				slog.With(slog.Any("error", err)).WarnContext(
 					r.ctx, "failed to find pools matching tags; not recording job",
+					"job_id", jobParams.ID,
 					"requested_tags", strings.Join(jobParams.Labels, ", "))
 				return
 			}
 			if len(potentialPools) == 0 {
 				slog.WarnContext(
 					r.ctx, "no pools matching tags; not recording job",
+					"job_id", jobParams.ID,
 					"requested_tags", strings.Join(jobParams.Labels, ", "))
 				return
 			}
 		}
+
+		slog.InfoContext(
+			r.ctx, "storing workflowjob",
+			"job_id", jobParams.ID,
+			"action", job.Action,
+			"requested_tags", strings.Join(jobParams.Labels, ", "))
 
 		if _, jobErr := r.store.CreateOrUpdateJob(r.ctx, jobParams); jobErr != nil {
 			slog.With(slog.Any("error", jobErr)).ErrorContext(
@@ -249,8 +257,10 @@ func (r *basePoolManager) HandleWorkflowJob(job params.WorkflowJob) error {
 			return errors.Wrap(err, "updating runner")
 		}
 		slog.DebugContext(
-			r.ctx, "marking instance as pending_delete",
-			"runner_name", util.SanitizeLogEntry(jobParams.RunnerName))
+			r.ctx, "marking instance as pending_delete for completed job",
+			"runner_name", util.SanitizeLogEntry(jobParams.RunnerName),
+			"job_id", jobParams.ID,
+		)
 		if _, err := r.setInstanceStatus(jobParams.RunnerName, commonParams.InstancePendingDelete, nil); err != nil {
 			if errors.Is(err, runnerErrors.ErrNotFound) {
 				return nil
@@ -396,6 +406,7 @@ func (r *basePoolManager) updateTools() error {
 // If we were offline and did not process the webhook, the instance will linger.
 // We need to remove it from the provider and database.
 func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []*github.Runner) error {
+	slog.DebugContext(r.ctx, "cleaning up orphaned provider runners")
 	dbInstances, err := r.store.ListEntityInstances(r.ctx, r.entity)
 	if err != nil {
 		return errors.Wrap(err, "fetching instances from db")
@@ -456,6 +467,9 @@ func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []*github.Runne
 		}
 
 		if ok := runnerNames[instance.Name]; !ok {
+			slog.DebugContext(
+				r.ctx, "runner is orphaned, removing",
+				"runner_name", instance.Name)
 			// Set pending_delete on DB field. Allow consolidate() to remove it.
 			if _, err := r.setInstanceStatus(instance.Name, commonParams.InstancePendingDelete, nil); err != nil {
 				slog.With(slog.Any("error", err)).ErrorContext(
@@ -472,6 +486,8 @@ func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []*github.Runne
 // of "running" in the provider, but that has not registered with Github, and has
 // received no new updates in the configured timeout interval.
 func (r *basePoolManager) reapTimedOutRunners(runners []*github.Runner) error {
+	slog.DebugContext(
+		r.ctx, "reaping timed out runners")
 	dbInstances, err := r.store.ListEntityInstances(r.ctx, r.entity)
 	if err != nil {
 		return errors.Wrap(err, "fetching instances from db")
@@ -490,7 +506,7 @@ func (r *basePoolManager) reapTimedOutRunners(runners []*github.Runner) error {
 
 	for _, instance := range dbInstances {
 		slog.DebugContext(
-			r.ctx, "attempting to lock instance",
+			r.ctx, "attempting to lock instance for reap check",
 			"runner_name", instance.Name)
 		lockAcquired := r.keyMux.TryLock(instance.Name)
 		if !lockAcquired {
@@ -534,6 +550,8 @@ func (r *basePoolManager) reapTimedOutRunners(runners []*github.Runner) error {
 // This may happen if someone manually deletes the instance in the provider. We need to
 // first remove the instance from github, and then from our database.
 func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []*github.Runner) error {
+	slog.DebugContext(
+		r.ctx, "cleaning up orphaned github runners")
 	poolInstanceCache := map[string][]commonParams.ProviderInstance{}
 	g, ctx := errgroup.WithContext(r.ctx)
 	for _, runner := range runners {
@@ -1061,6 +1079,11 @@ func (r *basePoolManager) scaleDownOnePool(ctx context.Context, pool params.Pool
 	for _, instanceToDelete := range idleWorkers[:numScaleDown] {
 		instanceToDelete := instanceToDelete
 
+		slog.DebugContext(
+			ctx, "attempting to acquire lock of instance for pool scale down",
+			"runner_name", instanceToDelete.Name,
+			"pool_id", pool.ID)
+
 		lockAcquired := r.keyMux.TryLock(instanceToDelete.Name)
 		if !lockAcquired {
 			slog.With(slog.Any("error", err)).ErrorContext(
@@ -1295,6 +1318,7 @@ func (r *basePoolManager) retryFailedInstances() error {
 }
 
 func (r *basePoolManager) scaleDown() error {
+	slog.DebugContext(r.ctx, "running scale down")
 	pools, err := r.store.ListEntityPools(r.ctx, r.entity)
 	if err != nil {
 		return fmt.Errorf("error listing pools: %w", err)
@@ -1386,6 +1410,7 @@ func (r *basePoolManager) deletePendingInstances() error {
 
 		slog.InfoContext(
 			r.ctx, "removing instance from pool",
+			"status", instance.Status,
 			"runner_name", instance.Name,
 			"pool_id", instance.PoolID)
 		lockAcquired := r.keyMux.TryLock(instance.Name)
@@ -1442,6 +1467,9 @@ func (r *basePoolManager) deletePendingInstances() error {
 				}
 			}(instance)
 
+			slog.DebugContext(
+				r.ctx, "setting instance status to deleting",
+				"runner_name", instance.Name)
 			if _, err := r.setInstanceStatus(instance.Name, commonParams.InstanceDeleting, nil); err != nil {
 				slog.With(slog.Any("error", err)).ErrorContext(
 					r.ctx, "failed to update runner status",
@@ -1577,6 +1605,8 @@ func (r *basePoolManager) runnerCleanup() (err error) {
 }
 
 func (r *basePoolManager) cleanupOrphanedRunners(runners []*github.Runner) error {
+	slog.DebugContext(
+		r.ctx, "cleaning up orphaned runners")
 	if err := r.cleanupOrphanedProviderRunners(runners); err != nil {
 		return errors.Wrap(err, "cleaning orphaned instances")
 	}
@@ -1998,6 +2028,7 @@ func (r *basePoolManager) FetchTools() ([]commonParams.RunnerApplicationDownload
 }
 
 func (r *basePoolManager) GetGithubRunners() ([]*github.Runner, error) {
+	slog.DebugContext(r.ctx, "fetching github runners")
 	opts := github.ListRunnersOptions{
 		ListOptions: github.ListOptions{
 			PerPage: 100,

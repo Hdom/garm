@@ -226,6 +226,27 @@ func (w *Worker) Start() (err error) {
 		return nil
 	}
 
+	// Subscribe before taking the snapshot so changes committed during startup
+	// remain queued until the worker starts processing events.
+	consumer, err := watcher.RegisterConsumer(
+		w.ctx, w.consumerID,
+		watcher.WithAny(
+			watcher.WithAll(
+				watcher.WithScaleSetFilter(w.scaleSet),
+				watcher.WithOperationTypeFilter(dbCommon.UpdateOperation),
+			),
+			watcher.WithScaleSetInstanceFilter(w.scaleSet),
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("error registering consumer: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			consumer.Close()
+		}
+	}()
+
 	instances, err := w.store.ListScaleSetInstances(w.ctx, w.scaleSet.ID, false)
 	if err != nil {
 		return fmt.Errorf("listing scale set instances: %w", err)
@@ -343,25 +364,6 @@ func (w *Worker) Start() (err error) {
 	if err := w.ensureScaleSetInGitHub(); err != nil {
 		return fmt.Errorf("failed to ensure scale set: %w", err)
 	}
-
-	consumer, err := watcher.RegisterConsumer(
-		w.ctx, w.consumerID,
-		watcher.WithAny(
-			watcher.WithAll(
-				watcher.WithScaleSetFilter(w.scaleSet),
-				watcher.WithOperationTypeFilter(dbCommon.UpdateOperation),
-			),
-			watcher.WithScaleSetInstanceFilter(w.scaleSet),
-		),
-	)
-	if err != nil {
-		return fmt.Errorf("error registering consumer: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			consumer.Close()
-		}
-	}()
 
 	slog.DebugContext(w.ctx, "creating scale set listener")
 	listener := newListener(w.ctx, w)

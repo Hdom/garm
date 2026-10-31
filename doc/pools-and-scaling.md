@@ -1,5 +1,13 @@
 # Pools and Scaling
 
+Pool instance creates and deletes share a controller-wide concurrency limit.
+Set `max_concurrent_pool_operations` in the `[default]` configuration section
+to a positive integer (default: `10`). This bounds combined operations across
+repository, organization, enterprise, and forge-instance pool managers. Work
+that cannot be admitted stays pending for reconciliation; waiting work does
+not launch another goroutine. Scale-set provider workers are separate from
+this pool limit.
+
 Pools are the core of GARM's runner management. Each pool defines a set of runners with the same configuration: provider, image, flavor, labels, and scaling parameters.
 
 - [Pools and Scaling](#pools-and-scaling)

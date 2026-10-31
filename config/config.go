@@ -225,6 +225,9 @@ func (l *Logging) Validate() error {
 }
 
 type Default struct {
+	// MaxConcurrentPoolOperations bounds combined pool creates/deletes across
+	// all entity managers. Nil uses the default; explicit values must be positive.
+	MaxConcurrentPoolOperations *int `toml:"max_concurrent_pool_operations" json:"max-concurrent-pool-operations,omitempty"`
 	// CallbackURL is the URL where the instances can send back status reports.
 	CallbackURL string `toml:"callback_url" json:"callback-url"`
 	// MetadataURL is the URL where instances can fetch information they may need
@@ -242,6 +245,9 @@ type Default struct {
 }
 
 func (d *Default) Validate() error {
+	if d.MaxConcurrentPoolOperations != nil && *d.MaxConcurrentPoolOperations <= 0 {
+		return fmt.Errorf("max_concurrent_pool_operations must be positive")
+	}
 	if d.CallbackURL != "" {
 		_, err := url.ParseRequestURI(d.CallbackURL)
 		if err != nil {
@@ -261,6 +267,13 @@ func (d *Default) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (d Default) PoolOperationLimit() int {
+	if d.MaxConcurrentPoolOperations == nil {
+		return 10
+	}
+	return *d.MaxConcurrentPoolOperations
 }
 
 // Provider holds access information for a particular provider.

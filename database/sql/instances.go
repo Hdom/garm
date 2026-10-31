@@ -133,6 +133,12 @@ func (s *sqlDatabase) getPoolInstanceByName(ctx context.Context, poolID string, 
 }
 
 func (s *sqlDatabase) getInstance(ctx context.Context, tx *gorm.DB, instanceNameOrID string, preload ...string) (Instance, error) {
+	return s.getInstanceWithPreloads(ctx, tx.Preload(clause.Associations), instanceNameOrID, preload...)
+}
+
+// getInstanceWithPreloads loads only the associations requested by an internal
+// operation. API reads continue to use getInstance for the full representation.
+func (s *sqlDatabase) getInstanceWithPreloads(ctx context.Context, tx *gorm.DB, instanceNameOrID string, preload ...string) (Instance, error) {
 	tx = tx.WithContext(ctx)
 	var instance Instance
 
@@ -152,7 +158,6 @@ func (s *sqlDatabase) getInstance(ctx context.Context, tx *gorm.DB, instanceName
 	}
 
 	q = q.Model(&Instance{}).
-		Preload(clause.Associations).
 		Where(whereClause, whereArg).
 		First(&instance)
 	if q.Error != nil {
@@ -412,7 +417,7 @@ func (s *sqlDatabase) UpdateInstance(ctx context.Context, instanceName string, p
 func (s *sqlDatabase) updateInstance(ctx context.Context, instanceName string, param params.UpdateInstanceParams, force bool) (params.Instance, error) {
 	var rowsAffected int64
 	err := s.conn.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		instance, err := s.getInstance(ctx, tx.Clauses(clause.Locking{Strength: "UPDATE"}), instanceName, "Pool", "ScaleSet")
+		instance, err := s.getInstanceWithPreloads(ctx, tx.Clauses(clause.Locking{Strength: "UPDATE"}), instanceName, "Pool", "ScaleSet")
 		if err != nil {
 			return fmt.Errorf("error updating instance: %w", err)
 		}
@@ -462,7 +467,11 @@ func (s *sqlDatabase) updateInstance(ctx context.Context, instanceName string, p
 		return params.Instance{}, fmt.Errorf("error updating instance: %w", err)
 	}
 
-	instance, err := s.getInstance(ctx, s.conn, instanceName, "Pool", "ScaleSet")
+	preload := []string{"Pool", "ScaleSet"}
+	if len(param.Addresses) > 0 {
+		preload = append(preload, "Addresses")
+	}
+	instance, err := s.getInstanceWithPreloads(ctx, s.conn, instanceName, preload...)
 	if err != nil {
 		return params.Instance{}, fmt.Errorf("error updating instance: %w", err)
 	}

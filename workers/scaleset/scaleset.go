@@ -74,11 +74,12 @@ type Worker struct {
 	consumerID     string
 	controllerInfo params.ControllerInfo
 
-	provider common.Provider
-	store    dbCommon.Store
-	scaleSet params.ScaleSet
-	entity   params.ForgeEntity
-	runners  map[string]params.Instance
+	provider        common.Provider
+	store           dbCommon.Store
+	scaleSet        params.ScaleSet
+	entity          params.ForgeEntity
+	runners         map[string]params.Instance
+	snapshotStarted time.Time
 
 	// pseudoPoolID is the stable pool ID reported to providers for this scale
 	// set. It is derived from immutable IDs, so it is computed once.
@@ -91,11 +92,11 @@ type Worker struct {
 	consumer dbCommon.Consumer
 
 	// eventQueue decouples the watcher consumer from event handling. The
-	// drain loop forwards events into it without blocking, and a single
+	// drain loop forwards events into a bounded queue, and a single
 	// Process goroutine applies them strictly in delivery order — handlers
 	// mutate w.runners, so out-of-order application would leave stale or
 	// ghost entries.
-	eventQueue *workersCommon.UnboundedChan[dbCommon.ChangePayload]
+	eventQueue *workersCommon.BoundedChan[dbCommon.ChangePayload]
 
 	listener *scaleSetListener
 
@@ -344,7 +345,7 @@ func (w *Worker) Start() (err error) {
 		return fmt.Errorf("failed to ensure scale set: %w", err)
 	}
 
-	consumer, err := watcher.RegisterConsumer(
+	consumer, err := watcher.RegisterReconciledConsumer(
 		w.ctx, w.consumerID,
 		watcher.WithAny(
 			watcher.WithAll(
@@ -370,7 +371,7 @@ func (w *Worker) Start() (err error) {
 	w.consumer = consumer
 	w.running = true
 	w.quit = make(chan struct{})
-	w.eventQueue = workersCommon.NewUnboundedChan[dbCommon.ChangePayload](w.ctx, w.quit)
+	w.eventQueue = workersCommon.NewBoundedChan[dbCommon.ChangePayload](w.ctx, w.quit, 256)
 
 	slog.DebugContext(w.ctx, "starting scale set worker loops", "scale_set", w.consumerID)
 	go w.eventQueue.Process(w.handleEvent)
@@ -781,21 +782,24 @@ func (w *Worker) handleScaleSetEvent(event dbCommon.ChangePayload) {
 	case dbCommon.UpdateOperation:
 		slog.DebugContext(w.ctx, "got update operation")
 		w.mux.Lock()
+		if scaleSet.UpdatedAt.Before(w.snapshotStarted) {
+			w.mux.Unlock()
+			return
+		}
+		scaleSet.Instances = nil
 
-		if scaleSet.MaxRunners < w.scaleSet.MaxRunners || !scaleSet.Enabled {
-			// we stop the listener if the scale set is disabled or if the max runners
-			// is decreased. In the case where max runners changes but the scale set
-			// is still enabled, we rely on the keepListenerAlive to restart the listener
-			// which will listen for new messages with the changed max runners. This way
-			// we don't have to potentially wait for 50 second for the max runner value
-			// to be updated, in which time we might get more runners spawned than the
-			// new max runner value.
-			if err := w.listener.Stop(); err != nil {
+		stopListener := scaleSet.MaxRunners < w.scaleSet.MaxRunners || !scaleSet.Enabled
+		listener := w.listener
+		w.scaleSet = scaleSet
+		w.mux.Unlock()
+		// Listener teardown may wait for a remote long poll. Let event and
+		// autoscale state continue to make progress while it stops.
+		if stopListener && listener != nil {
+			if err := listener.Stop(); err != nil {
 				slog.ErrorContext(w.ctx, "error stopping listener", "error", err)
 			}
 		}
-		w.scaleSet = scaleSet
-		w.mux.Unlock()
+
 	default:
 		slog.DebugContext(w.ctx, "invalid operation type; ignoring", "operation_type", event.Operation)
 	}
@@ -823,11 +827,19 @@ func (w *Worker) handleInstanceEntityEvent(event dbCommon.ChangePayload) {
 	case dbCommon.CreateOperation:
 		slog.DebugContext(w.ctx, "got create operation")
 		w.mux.Lock()
+		if current, exists := w.runners[instance.ID]; instance.UpdatedAt.Before(w.snapshotStarted) || (exists && instance.UpdatedAt.Before(current.UpdatedAt)) {
+			w.mux.Unlock()
+			return
+		}
 		w.runners[instance.ID] = instance
 		w.mux.Unlock()
 	case dbCommon.UpdateOperation:
 		slog.DebugContext(w.ctx, "got update operation")
 		w.mux.Lock()
+		if current, exists := w.runners[instance.ID]; instance.UpdatedAt.Before(w.snapshotStarted) || (exists && instance.UpdatedAt.Before(current.UpdatedAt)) {
+			w.mux.Unlock()
+			return
+		}
 		if instance.Status == commonParams.InstanceDeleted {
 			if err := w.handleInstanceCleanup(instance); err != nil {
 				slog.ErrorContext(w.ctx, "error cleaning up instance", "instance_id", instance.ID, "error", err)
@@ -849,6 +861,8 @@ func (w *Worker) handleInstanceEntityEvent(event dbCommon.ChangePayload) {
 
 func (w *Worker) handleEvent(event dbCommon.ChangePayload) {
 	switch event.EntityType {
+	case dbCommon.ResyncEntityType:
+		w.reconcileSnapshot()
 	case dbCommon.ScaleSetEntityType:
 		slog.DebugContext(w.ctx, "got scaleset event")
 		w.handleScaleSetEvent(event)
@@ -872,9 +886,8 @@ func (w *Worker) loop() {
 				slog.InfoContext(w.ctx, "consumer channel closed")
 				return
 			}
-			// Forward to the serialized event queue. The queue router always
-			// accepts, so this cannot block the watcher drain; events are
-			// then applied in order by the Process goroutine.
+			// Forward to bounded serialized work. If it fills, the bounded
+			// watcher coalesces overflow into a database resync marker.
 			select {
 			case w.eventQueue.In() <- event:
 			case <-w.quit:

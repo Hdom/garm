@@ -23,6 +23,9 @@ type (
 )
 
 const (
+	// ResyncEntityType asks opt-in state consumers to reload authoritative DB
+	// state after their bounded notification queue overflows.
+	ResyncEntityType            DatabaseEntityType = "resync"
 	RepositoryEntityType        DatabaseEntityType = "repository"
 	OrganizationEntityType      DatabaseEntityType = "organization"
 	EnterpriseEntityType        DatabaseEntityType = "enterprise"

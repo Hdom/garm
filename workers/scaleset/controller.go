@@ -98,7 +98,8 @@ type Controller struct {
 	providers map[string]common.Provider
 	backoff   *workersCommon.Backoff
 
-	eventQueue *workersCommon.UnboundedChan[dbCommon.ChangePayload]
+	eventQueue      *workersCommon.BoundedChan[dbCommon.ChangePayload]
+	snapshotStarted time.Time
 
 	mux     sync.Mutex
 	running bool
@@ -142,7 +143,7 @@ func (c *Controller) Start() (err error) {
 		}
 	}
 
-	consumer, err := watcher.RegisterConsumer(
+	consumer, err := watcher.RegisterReconciledConsumer(
 		c.ctx, c.consumerID,
 		composeControllerWatcherFilters(c.Entity),
 	)
@@ -154,7 +155,7 @@ func (c *Controller) Start() (err error) {
 	c.consumer = consumer
 	c.running = true
 	c.quit = make(chan struct{})
-	c.eventQueue = workersCommon.NewUnboundedChan[dbCommon.ChangePayload](c.ctx, c.quit)
+	c.eventQueue = workersCommon.NewBoundedChan[dbCommon.ChangePayload](c.ctx, c.quit, 256)
 	c.mux.Unlock()
 
 	go c.loop()

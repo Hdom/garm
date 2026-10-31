@@ -44,6 +44,10 @@ type consumer struct {
 	// queueLen mirrors the dispatch queue depth so it can be read from
 	// outside the dispatch goroutine (e.g. by the metrics collector).
 	queueLen atomic.Int64
+	// queueLimit enables bounded state notifications. On overflow, pending
+	// deltas are replaced by a resync marker; only consumers that can reload
+	// authoritative database state opt into this mode.
+	queueLimit int
 
 	mux    sync.Mutex
 	closed bool
@@ -119,8 +123,22 @@ func (w *consumer) dispatch() {
 	defer close(w.messages)
 
 	var queue []common.ChangePayload
+	resync := false
 	defer w.queueLen.Store(0)
 	for {
+		if resync {
+			w.queueLen.Store(1)
+			select {
+			case <-w.in: // Further changes are covered by the pending snapshot.
+			case w.messages <- common.ChangePayload{EntityType: common.ResyncEntityType}:
+				resync = false
+			case <-w.quit:
+				return
+			case <-w.ctx.Done():
+				return
+			}
+			continue
+		}
 		w.queueLen.Store(int64(len(queue)))
 		if len(queue) == 0 {
 			select {
@@ -136,6 +154,13 @@ func (w *consumer) dispatch() {
 
 		select {
 		case payload := <-w.in:
+			if w.queueLimit > 0 && len(queue) >= w.queueLimit {
+				slog.WarnContext(w.ctx, "bounded consumer queue saturated; scheduling database resync", "consumer_id", w.id, "queue_limit", w.queueLimit)
+				clear(queue)
+				queue = queue[:0]
+				resync = true
+				continue
+			}
 			queue = append(queue, payload)
 			if len(queue)%queueWarnThreshold == 0 {
 				slog.WarnContext(
@@ -143,6 +168,7 @@ func (w *consumer) dispatch() {
 					"consumer_id", w.id, "queue_depth", len(queue))
 			}
 		case w.messages <- queue[0]:
+			queue[0] = common.ChangePayload{}
 			queue = queue[1:]
 		case <-w.quit:
 			return

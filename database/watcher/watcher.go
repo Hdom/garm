@@ -67,6 +67,22 @@ func RegisterConsumer(ctx context.Context, id string, filters ...common.PayloadF
 	return databaseWatcher.RegisterConsumer(ctx, id, filters...)
 }
 
+// RegisterReconciledConsumer opts a state-based consumer into bounded watcher
+// delivery. Overflow triggers a DB resync rather than losing terminal state or
+// shifting an unbounded backlog into the watcher. Test/custom watchers without
+// this capability retain their existing registration contract.
+func RegisterReconciledConsumer(ctx context.Context, id string, filters ...common.PayloadFilterFunc) (common.Consumer, error) {
+	if databaseWatcher == nil {
+		return nil, common.ErrWatcherNotInitialized
+	}
+	if reconciled, ok := databaseWatcher.(interface {
+		RegisterReconciledConsumer(context.Context, string, ...common.PayloadFilterFunc) (common.Consumer, error)
+	}); ok {
+		return reconciled.RegisterReconciledConsumer(ctx, id, filters...)
+	}
+	return RegisterConsumer(ctx, id, filters...)
+}
+
 type watcher struct {
 	producers map[string]*producer
 	consumers map[string]*consumer
@@ -139,6 +155,14 @@ func (w *watcher) serviceProducer(prod *producer) {
 }
 
 func (w *watcher) RegisterConsumer(ctx context.Context, id string, filters ...common.PayloadFilterFunc) (common.Consumer, error) {
+	return w.registerConsumer(ctx, id, 0, filters...)
+}
+
+func (w *watcher) RegisterReconciledConsumer(ctx context.Context, id string, filters ...common.PayloadFilterFunc) (common.Consumer, error) {
+	return w.registerConsumer(ctx, id, 256, filters...)
+}
+
+func (w *watcher) registerConsumer(ctx context.Context, id string, limit int, filters ...common.PayloadFilterFunc) (common.Consumer, error) {
 	w.mux.Lock()
 	defer w.mux.Unlock()
 	if _, ok := w.consumers[id]; ok {
@@ -147,12 +171,13 @@ func (w *watcher) RegisterConsumer(ctx context.Context, id string, filters ...co
 	c := &consumer{
 		// Buffering the channels here helps with latency. The current
 		// implementation is non blocking.
-		messages: make(chan common.ChangePayload, 128),
-		in:       make(chan common.ChangePayload, 128),
-		filters:  filters,
-		quit:     make(chan struct{}),
-		id:       id,
-		ctx:      ctx,
+		messages:   make(chan common.ChangePayload, 128),
+		in:         make(chan common.ChangePayload, 128),
+		filters:    filters,
+		quit:       make(chan struct{}),
+		id:         id,
+		ctx:        ctx,
+		queueLimit: limit,
 	}
 	w.consumers[id] = c
 	go c.dispatch()

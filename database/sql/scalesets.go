@@ -230,7 +230,7 @@ func (s *sqlDatabase) UpdateEntityScaleSet(ctx context.Context, entity params.Fo
 		}
 	}()
 	err = s.conn.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		scaleSet, err := s.getEntityScaleSet(tx.Clauses(clause.Locking{Strength: "UPDATE"}), entity.EntityType, entity.ID, scaleSetID, "Instances", "Tags")
+		scaleSet, err := s.getEntityScaleSet(tx.Clauses(clause.Locking{Strength: "UPDATE"}), entity.EntityType, entity.ID, scaleSetID, "Tags")
 		if err != nil {
 			return fmt.Errorf("error fetching scale set: %w", err)
 		}
@@ -256,7 +256,10 @@ func (s *sqlDatabase) UpdateEntityScaleSet(ctx context.Context, entity params.Fo
 		return params.ScaleSet{}, err
 	}
 
-	updatedScaleSet, err = s.GetScaleSetByID(ctx, scaleSetID)
+	metadata, err := s.getScaleSetMetadata(s.conn.WithContext(ctx), scaleSetID)
+	if err == nil {
+		updatedScaleSet, err = s.sqlToCommonScaleSet(metadata)
+	}
 	if err != nil {
 		return params.ScaleSet{}, err
 	}
@@ -435,6 +438,12 @@ func (s *sqlDatabase) updateScaleSet(tx *gorm.DB, scaleSet ScaleSet, param param
 	return commonScaleSet, rowsAffected, nil
 }
 
+// getScaleSetMetadata excludes instance snapshots from metadata writes and
+// notifications. Full API reads retain GetScaleSetByID's Instances preload.
+func (s *sqlDatabase) getScaleSetMetadata(tx *gorm.DB, id uint) (ScaleSet, error) {
+	return s.getScaleSetByID(tx, id, "Enterprise", "Enterprise.Endpoint", "Organization", "Organization.Endpoint", "Repository", "Repository.Endpoint", "Template", "Proxy", "Tags")
+}
+
 func (s *sqlDatabase) GetScaleSetByID(ctx context.Context, scaleSet uint) (params.ScaleSet, error) {
 	set, err := s.getScaleSetByID(
 		s.conn.WithContext(ctx),
@@ -497,7 +506,7 @@ func (s *sqlDatabase) SetScaleSetLastMessageID(ctx context.Context, scaleSetID u
 		}
 	}()
 	if err := s.conn.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		dbSet, err := s.getScaleSetByID(tx.Clauses(clause.Locking{Strength: "UPDATE"}), scaleSetID, "Instances", "Enterprise", "Organization", "Repository")
+		dbSet, err := s.getScaleSetMetadata(tx.Clauses(clause.Locking{Strength: "UPDATE"}), scaleSetID)
 		if err != nil {
 			return fmt.Errorf("error fetching scale set: %w", err)
 		}
@@ -510,7 +519,7 @@ func (s *sqlDatabase) SetScaleSetLastMessageID(ctx context.Context, scaleSetID u
 		rowsAffected = result.RowsAffected
 
 		// Reload to get the updated value
-		dbSet, err = s.getScaleSetByID(tx, scaleSetID, "Instances", "Enterprise", "Organization", "Repository")
+		dbSet, err = s.getScaleSetMetadata(tx, scaleSetID)
 		if err != nil {
 			return fmt.Errorf("error reloading scale set: %w", err)
 		}
@@ -534,7 +543,7 @@ func (s *sqlDatabase) SetScaleSetDesiredRunnerCount(ctx context.Context, scaleSe
 		}
 	}()
 	if err := s.conn.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		dbSet, err := s.getScaleSetByID(tx.Clauses(clause.Locking{Strength: "UPDATE"}), scaleSetID, "Instances", "Enterprise", "Organization", "Repository")
+		dbSet, err := s.getScaleSetMetadata(tx.Clauses(clause.Locking{Strength: "UPDATE"}), scaleSetID)
 		if err != nil {
 			return fmt.Errorf("error fetching scale set: %w", err)
 		}
@@ -547,7 +556,7 @@ func (s *sqlDatabase) SetScaleSetDesiredRunnerCount(ctx context.Context, scaleSe
 		rowsAffected = result.RowsAffected
 
 		// Reload to get the updated value
-		dbSet, err = s.getScaleSetByID(tx, scaleSetID, "Instances", "Enterprise", "Organization", "Repository")
+		dbSet, err = s.getScaleSetMetadata(tx, scaleSetID)
 		if err != nil {
 			return fmt.Errorf("error reloading scale set: %w", err)
 		}

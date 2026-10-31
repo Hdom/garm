@@ -99,7 +99,8 @@ func NewRunner(ctx context.Context, cfg config.Config, db dbCommon.Store, token 
 }
 
 type poolManagerCtrl struct {
-	mux sync.Mutex
+	instanceOperations *pool.InstanceOperationLimiter
+	mux                sync.Mutex
 
 	config config.Config
 	store  dbCommon.Store
@@ -111,6 +112,18 @@ type poolManagerCtrl struct {
 	forgeInstances map[string]common.PoolManager
 }
 
+// poolOperationLimiter is called with p.mux held by manager creation.
+func (p *poolManagerCtrl) poolOperationLimiter() (*pool.InstanceOperationLimiter, error) {
+	if p.instanceOperations == nil {
+		limiter, err := pool.NewInstanceOperationLimiter(p.config.Default.PoolOperationLimit())
+		if err != nil {
+			return nil, err
+		}
+		p.instanceOperations = limiter
+	}
+	return p.instanceOperations, nil
+}
+
 func (p *poolManagerCtrl) CreateRepoPoolManager(ctx context.Context, repo params.Repository, providers map[string]common.Provider, store dbCommon.Store) (common.PoolManager, error) {
 	p.mux.Lock()
 	defer p.mux.Unlock()
@@ -120,7 +133,11 @@ func (p *poolManagerCtrl) CreateRepoPoolManager(ctx context.Context, repo params
 		return nil, fmt.Errorf("error getting entity: %w", err)
 	}
 
-	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store)
+	limiter, err := p.poolOperationLimiter()
+	if err != nil {
+		return nil, err
+	}
+	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store, pool.WithInstanceOperationLimiter(limiter))
 	if err != nil {
 		return nil, fmt.Errorf("error creating repo pool manager: %w", err)
 	}
@@ -162,7 +179,11 @@ func (p *poolManagerCtrl) CreateOrgPoolManager(ctx context.Context, org params.O
 		return nil, fmt.Errorf("error getting entity: %w", err)
 	}
 
-	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store)
+	limiter, err := p.poolOperationLimiter()
+	if err != nil {
+		return nil, err
+	}
+	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store, pool.WithInstanceOperationLimiter(limiter))
 	if err != nil {
 		return nil, fmt.Errorf("error creating org pool manager: %w", err)
 	}
@@ -204,7 +225,11 @@ func (p *poolManagerCtrl) CreateEnterprisePoolManager(ctx context.Context, enter
 		return nil, fmt.Errorf("error getting entity: %w", err)
 	}
 
-	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store)
+	limiter, err := p.poolOperationLimiter()
+	if err != nil {
+		return nil, err
+	}
+	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store, pool.WithInstanceOperationLimiter(limiter))
 	if err != nil {
 		return nil, fmt.Errorf("error creating enterprise pool manager: %w", err)
 	}
@@ -246,7 +271,11 @@ func (p *poolManagerCtrl) CreateForgeInstancePoolManager(ctx context.Context, fo
 		return nil, fmt.Errorf("error getting entity: %w", err)
 	}
 
-	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store)
+	limiter, err := p.poolOperationLimiter()
+	if err != nil {
+		return nil, err
+	}
+	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store, pool.WithInstanceOperationLimiter(limiter))
 	if err != nil {
 		return nil, fmt.Errorf("error creating forge instance pool manager: %w", err)
 	}

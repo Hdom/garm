@@ -72,7 +72,7 @@ const (
 	maxCreateAttempts = 5
 )
 
-func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instanceTokenGetter auth.InstanceTokenGetter, providers map[string]common.Provider, store dbCommon.Store) (common.PoolManager, error) {
+func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instanceTokenGetter auth.InstanceTokenGetter, providers map[string]common.Provider, store dbCommon.Store, options ...Option) (common.PoolManager, error) {
 	ctx = garmUtil.WithSlogContext(
 		ctx,
 		slog.Any("pool_mgr", entity.String()),
@@ -94,6 +94,13 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 	}
 
 	consumerID := fmt.Sprintf("pool-manager-%s-%s", entity.String(), entity.Credentials.Endpoint.Name)
+	ctx, cancel := context.WithCancel(ctx)
+	created := false
+	defer func() {
+		if !created {
+			cancel()
+		}
+	}()
 	slog.InfoContext(ctx, "registering consumer", "consumer_id", consumerID)
 	consumer, err := watcher.RegisterConsumer(
 		ctx, consumerID,
@@ -118,6 +125,7 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 	}
 	repo := &basePoolManager{
 		ctx:                 ctx,
+		cancel:              cancel,
 		consumerID:          consumerID,
 		entity:              entity,
 		ghcli:               ghc,
@@ -138,18 +146,28 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 		backoff:        backoff,
 		consumer:       consumer,
 	}
+	for _, option := range options {
+		if err := option(repo); err != nil {
+			consumer.Close()
+			return nil, err
+		}
+	}
+	created = true
 	return repo, nil
 }
 
 type basePoolManager struct {
-	ctx                 context.Context
-	consumerID          string
-	entity              params.ForgeEntity
-	ghcli               common.GithubClient
-	scaleSetClient      *scalesets.ScaleSetClient
-	controllerInfo      params.ControllerInfo
-	instanceTokenGetter auth.InstanceTokenGetter
-	consumer            dbCommon.Consumer
+	cancel                 context.CancelFunc
+	instanceOperations     *InstanceOperationLimiter
+	instanceOperationsOnce sync.Once
+	ctx                    context.Context
+	consumerID             string
+	entity                 params.ForgeEntity
+	ghcli                  common.GithubClient
+	scaleSetClient         *scalesets.ScaleSetClient
+	controllerInfo         params.ControllerInfo
+	instanceTokenGetter    auth.InstanceTokenGetter
+	consumer               dbCommon.Consumer
 
 	store dbCommon.Store
 	jobs  map[int64]params.Job
@@ -1772,7 +1790,20 @@ func (r *basePoolManager) deletePendingInstances() error {
 			continue
 		}
 
+		if !r.acquireInstanceOperation() {
+			locking.Unlock(instance.Name, false)
+			return nil
+		}
+
 		go func(instance params.Instance) (err error) {
+			defer r.releaseInstanceOperation()
+			deleteMux := false
+			defer func() {
+				locking.Unlock(instance.Name, deleteMux)
+				if deleteMux {
+					r.backoff.Delete(instance.Name)
+				}
+			}()
 			// Prevent Thundering Herd. Should alleviate some of the database
 			// is locked errors in sqlite3.
 			num, err := rand.Int(rand.Reader, big.NewInt(2000))
@@ -1785,16 +1816,6 @@ func (r *basePoolManager) deletePendingInstances() error {
 			}
 
 			currentStatus := instance.Status
-			deleteMux := false
-			defer func() {
-				locking.Unlock(instance.Name, deleteMux)
-				if deleteMux {
-					// deleteMux is set only when the instance was successfully removed.
-					// We can use it as a marker to signal that the backoff is no longer
-					// needed.
-					r.backoff.Delete(instance.Name)
-				}
-			}()
 			defer func(instance params.Instance) {
 				if err != nil {
 					slog.With(slog.Any("error", err)).ErrorContext(
@@ -1877,12 +1898,18 @@ func (r *basePoolManager) addPendingInstances() error {
 			continue
 		}
 
+		if !r.acquireInstanceOperation() {
+			locking.Unlock(instance.Name, false)
+			return nil
+		}
+
 		// Set the instance to "creating" before launching the goroutine. This will ensure that addPendingInstances()
 		// won't attempt to create the runner a second time.
 		if _, err := r.setInstanceStatus(instance.Name, commonParams.InstanceCreating, nil, false); err != nil {
 			slog.With(slog.Any("error", err)).ErrorContext(
 				r.ctx, "failed to update runner status",
 				"runner_name", instance.Name)
+			r.releaseInstanceOperation()
 			locking.Unlock(instance.Name, false)
 			// We failed to transition the instance to Creating. This means that garm will retry to create this instance
 			// when the loop runs again and we end up with multiple instances.
@@ -1890,6 +1917,7 @@ func (r *basePoolManager) addPendingInstances() error {
 		}
 
 		go func(instance params.Instance) {
+			defer r.releaseInstanceOperation()
 			defer locking.Unlock(instance.Name, false)
 			slog.InfoContext(
 				r.ctx, "creating instance in pool",
@@ -2046,6 +2074,9 @@ func (r *basePoolManager) Start() error {
 }
 
 func (r *basePoolManager) Stop() error {
+	if r.cancel != nil {
+		r.cancel()
+	}
 	close(r.quit)
 	return nil
 }

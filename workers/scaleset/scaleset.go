@@ -600,6 +600,19 @@ func (w *Worker) consolidateRunnerState(listedAt time.Time, runners []params.Run
 			// status state machine, not by these locks.
 			defer locking.Unlock(name, false)
 
+			// A list response can omit a runner during pagination or concurrent
+			// registration. Only a direct lookup returning not-found is evidence
+			// that this registration is gone; errors are not deletion evidence.
+			if runner.AgentID == 0 {
+				continue
+			}
+			if _, err := scaleSetCli.GetRunner(w.ctx, runner.AgentID); err == nil {
+				continue
+			} else if !errors.Is(err, runnerErrors.ErrNotFound) {
+				slog.WarnContext(w.ctx, "cannot confirm missing runner; deferring cleanup", "runner_name", name, "error", err)
+				continue
+			}
+
 			// Aditional guard against accidentally removing a runner that has picked
 			// up a job, but that got past our safety checks (ex: GH api didn't return it
 			// when we listed)

@@ -1101,7 +1101,7 @@ func (w *Worker) handleScaleUp() {
 		return
 	}
 
-	if w.targetRunners() <= w.runnerCount() {
+	if w.targetRunners() <= w.runnableRunnerCount() || w.runnerCount() >= int(w.scaleSet.MaxRunners) {
 		slog.DebugContext(w.ctx, "target is less than or equal to current; not scaling up")
 		return
 	}
@@ -1117,7 +1117,8 @@ func (w *Worker) handleScaleUp() {
 		slog.ErrorContext(w.ctx, "error getting scale set client", "error", err)
 		return
 	}
-	for i := w.runnerCount(); i < w.targetRunners(); i++ {
+	needed := min(w.targetRunners()-w.runnableRunnerCount(), int(w.scaleSet.MaxRunners)-w.runnerCount())
+	for i := 0; i < needed; i++ {
 		newRunnerName := strings.ToLower(fmt.Sprintf("%s-%s", w.scaleSet.GetRunnerPrefix(), util.NewID()))
 		jitConfig, err := scaleSetCli.GenerateJitRunnerConfig(w.ctx, newRunnerName, w.scaleSet.ScaleSetID)
 		if err != nil {
@@ -1178,7 +1179,7 @@ func (w *Worker) waitForToolsOrCancel() (hasTools, stopped bool) {
 }
 
 func (w *Worker) handleScaleDown() {
-	delta := w.runnerCount() - w.targetRunners()
+	delta := w.runnableRunnerCount() - w.targetRunners()
 	if delta <= 0 {
 		return
 	}
@@ -1187,19 +1188,9 @@ func (w *Worker) handleScaleDown() {
 		slog.ErrorContext(w.ctx, "error getting scale set client", "error", err)
 		return
 	}
-	// Runners already on their way out satisfy part of the delta before any
-	// new victim is picked. Counting them during the removal loop instead
-	// would make the outcome depend on map iteration order: an idle runner
-	// could be removed while a runner already being deleted would have
-	// covered the delta.
+	// Cleanup records are excluded from runnable capacity and cannot satisfy
+	// a surplus of job-serving runners. Physical occupancy is guarded on scale-up.
 	removed := 0
-	for _, runner := range w.runners {
-		switch runner.Status {
-		case commonParams.InstancePendingDelete, commonParams.InstancePendingForceDelete,
-			commonParams.InstanceDeleting:
-			removed++
-		}
-	}
 
 	for _, runner := range w.runners {
 		slog.InfoContext(w.ctx, "considering runners for removal", "delta", delta, "removed", removed)
@@ -1271,7 +1262,7 @@ func (w *Worker) handleScaleDown() {
 			removed++
 		case commonParams.InstancePendingDelete, commonParams.InstancePendingForceDelete,
 			commonParams.InstanceDeleting:
-			// Already counted against the delta before the loop.
+			// Cleanup does not contribute to runnable capacity or its surplus.
 			continue
 		case commonParams.InstanceDeleted:
 			// Provider resource is gone and the record is excluded from
@@ -1306,6 +1297,21 @@ func (w *Worker) runnerCount() int {
 			continue
 		}
 		count++
+	}
+	return count
+}
+
+// runnableRunnerCount includes provisioning work but excludes failed or
+// terminating runners. runnerCount separately protects the physical maximum.
+func (w *Worker) runnableRunnerCount() int {
+	count := 0
+	for _, runner := range w.runners {
+		switch runner.Status {
+		case commonParams.InstancePendingCreate, commonParams.InstanceCreating, commonParams.InstanceRunning:
+			if runner.RunnerStatus != params.RunnerTerminated && runner.RunnerStatus != params.RunnerFailed {
+				count++
+			}
+		}
 	}
 	return count
 }
@@ -1355,17 +1361,17 @@ func (w *Worker) handleAutoScale() {
 				continue
 			}
 
-			if w.runnerCount() == w.targetRunners() {
-				lastMsgDebugLog("desired runner count reached", w.targetRunners(), w.runnerCount())
+			if w.runnableRunnerCount() == w.targetRunners() {
+				lastMsgDebugLog("desired runner count reached", w.targetRunners(), w.runnableRunnerCount())
 				w.mux.Unlock()
 				continue
 			}
 
-			if w.runnerCount() < w.targetRunners() {
-				lastMsgDebugLog("scaling up", w.targetRunners(), w.runnerCount())
+			if w.runnableRunnerCount() < w.targetRunners() {
+				lastMsgDebugLog("scaling up", w.targetRunners(), w.runnableRunnerCount())
 				w.handleScaleUp()
 			} else {
-				lastMsgDebugLog("attempting to scale down", w.targetRunners(), w.runnerCount())
+				lastMsgDebugLog("attempting to scale down", w.targetRunners(), w.runnableRunnerCount())
 				w.handleScaleDown()
 			}
 			w.mux.Unlock()

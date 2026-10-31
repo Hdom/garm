@@ -22,6 +22,10 @@ import (
 )
 
 func (c *Controller) handleWatcherEvent(event dbCommon.ChangePayload) {
+	if event.EntityType == dbCommon.ResyncEntityType {
+		c.reconcileSnapshot()
+		return
+	}
 	c.mux.Lock()
 	defer c.mux.Unlock()
 
@@ -50,6 +54,10 @@ func (c *Controller) handleScaleSet(event dbCommon.ChangePayload) {
 		return
 	}
 
+	if event.Operation != dbCommon.DeleteOperation && scaleSet.UpdatedAt.Before(c.snapshotStarted) {
+		return
+	}
+	scaleSet.Instances = nil
 	switch event.Operation {
 	case dbCommon.CreateOperation:
 		slog.DebugContext(c.ctx, "got create operation for scale set", "scale_set_id", scaleSet.ID, "scale_set_name", scaleSet.Name)
@@ -186,6 +194,9 @@ func (c *Controller) handleEntityEvent(event dbCommon.ChangePayload) {
 		return
 	}
 
+	if entity.UpdatedAt.Before(c.snapshotStarted) {
+		return
+	}
 	switch event.Operation {
 	case dbCommon.UpdateOperation:
 		slog.DebugContext(c.ctx, "got update operation")

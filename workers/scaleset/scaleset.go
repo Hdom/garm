@@ -1156,19 +1156,60 @@ func (w *Worker) handleScaleUp() {
 	}
 }
 
+const waitingForToolsReason = "waiting_for_tools: GitHub runner applications are not cached"
+
+// setToolsWaiting persists the prerequisite wait in the API-visible extended
+// state. Only transitions are written, without holding the worker state mutex.
+func (w *Worker) setToolsWaiting(waiting bool) {
+	w.mux.Lock()
+	previous := w.scaleSet.ExtendedState
+	next := ""
+	if waiting {
+		next = waitingForToolsReason
+	}
+	if previous == next || (waiting && previous != "") || (!waiting && previous != waitingForToolsReason) {
+		w.mux.Unlock()
+		return
+	}
+	entity, err := w.scaleSet.GetEntity()
+	id := w.scaleSet.ID
+	w.mux.Unlock()
+	if err != nil {
+		return
+	}
+	if _, err := w.store.UpdateEntityScaleSet(w.ctx, entity, id, params.UpdateScaleSetParams{ExtendedState: &next}, nil); err != nil {
+		slog.WarnContext(w.ctx, "failed to update tools readiness state", "error", err)
+		return
+	}
+	w.mux.Lock()
+	if w.scaleSet.ExtendedState == previous {
+		w.scaleSet.ExtendedState = next
+	}
+	w.mux.Unlock()
+	if waiting {
+		slog.InfoContext(w.ctx, "scale set autoscaling is waiting for GitHub runner tools")
+	} else {
+		slog.InfoContext(w.ctx, "GitHub runner tools are available; resuming autoscaling")
+	}
+}
+
 func (w *Worker) waitForToolsOrCancel() (hasTools, stopped bool) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	select {
 	case <-ticker.C:
+		w.mux.Lock()
 		entity, err := w.scaleSet.GetEntity()
+		w.mux.Unlock()
 		if err != nil {
 			slog.ErrorContext(w.ctx, "error getting entity", "error", err)
 		}
 		if _, err := cache.GetGithubToolsCache(entity.ID); err != nil {
+			w.setToolsWaiting(true)
 			slog.DebugContext(w.ctx, "tools not found in cache; waiting for tools")
 			return false, false
 		}
+		w.setToolsWaiting(false)
 		return true, false
 	case <-w.quit:
 		return false, true

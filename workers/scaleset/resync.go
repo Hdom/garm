@@ -31,8 +31,8 @@ func (w *Worker) reconcileSnapshot() {
 }
 
 func (w *Worker) reloadSnapshot() error {
-	// GORM timestamps have millisecond precision. A finer boundary could
-	// incorrectly discard a genuine update committed in the same millisecond.
+	// Database timestamps may have coarser precision than time.Now. Round down
+	// so a genuine update in the same millisecond is not rejected as older.
 	started := time.Now().Truncate(time.Millisecond)
 	w.mux.Lock()
 	id := w.scaleSet.ID

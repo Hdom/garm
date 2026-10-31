@@ -188,3 +188,11 @@ func TestPoolOperationLimiterRejectsInvalidLimits(t *testing.T) {
 		require.Error(t, err)
 	}
 }
+
+func TestPoolManagerStopCancelsOutstandingOperations(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &basePoolManager{ctx: ctx, cancel: cancel, quit: make(chan struct{})}
+	require.NoError(t, r.Stop())
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+	require.False(t, r.acquireInstanceOperation(), "stopped managers must not admit more work")
+}

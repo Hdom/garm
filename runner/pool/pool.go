@@ -94,6 +94,13 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 	}
 
 	consumerID := fmt.Sprintf("pool-manager-%s-%s", entity.String(), entity.Credentials.Endpoint.Name)
+	ctx, cancel := context.WithCancel(ctx)
+	created := false
+	defer func() {
+		if !created {
+			cancel()
+		}
+	}()
 	slog.InfoContext(ctx, "registering consumer", "consumer_id", consumerID)
 	consumer, err := watcher.RegisterConsumer(
 		ctx, consumerID,
@@ -118,6 +125,7 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 	}
 	repo := &basePoolManager{
 		ctx:                 ctx,
+		cancel:              cancel,
 		consumerID:          consumerID,
 		entity:              entity,
 		ghcli:               ghc,
@@ -144,10 +152,12 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 			return nil, err
 		}
 	}
+	created = true
 	return repo, nil
 }
 
 type basePoolManager struct {
+	cancel                 context.CancelFunc
 	instanceOperations     *InstanceOperationLimiter
 	instanceOperationsOnce sync.Once
 	ctx                    context.Context
@@ -2064,6 +2074,9 @@ func (r *basePoolManager) Start() error {
 }
 
 func (r *basePoolManager) Stop() error {
+	if r.cancel != nil {
+		r.cancel()
+	}
 	close(r.quit)
 	return nil
 }
